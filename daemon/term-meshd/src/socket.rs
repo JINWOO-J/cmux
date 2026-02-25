@@ -478,6 +478,142 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             Ok(serde_json::to_value(inputs).unwrap())
         }
 
+        // --- Agent Activity & Heartbeat (Orchestration) ---
+        "agent.set_activity" => {
+            #[derive(Deserialize)]
+            struct P { session_id: String, activity: String, #[serde(default)] task_id: Option<String> }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(p) => {
+                    let activity = crate::agent::AgentActivity::from_str(&p.activity);
+                    ctx.agent_manager.set_activity(&p.session_id, activity, p.task_id.as_deref())
+                        .map(|_| serde_json::json!("ok"))
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "agent.heartbeat" => {
+            #[derive(Deserialize)]
+            struct P { session_id: String }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(p) => ctx.agent_manager.heartbeat(&p.session_id)
+                    .map(|_| serde_json::json!("ok")),
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "agent.idle_list" => {
+            let idle = ctx.agent_manager.agents_idle();
+            Ok(serde_json::to_value(idle).unwrap())
+        }
+
+        // --- Task Complete/Fail/Ready (Orchestration) ---
+        "task.complete" => {
+            #[derive(Deserialize)]
+            struct P { task_id: String, #[serde(default)] agent_id: Option<String>, #[serde(default)] result: Option<String> }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(p) => ctx.agent_manager.task_complete(&p.task_id, p.agent_id.as_deref(), p.result.as_deref())
+                    .map(|t| serde_json::to_value(t).unwrap()),
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "task.fail" => {
+            #[derive(Deserialize)]
+            struct P { task_id: String, #[serde(default)] agent_id: Option<String>, #[serde(default)] error: Option<String> }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(p) => ctx.agent_manager.task_fail(&p.task_id, p.agent_id.as_deref(), p.error.as_deref())
+                    .map(|t| serde_json::to_value(t).unwrap()),
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "task.ready_list" => {
+            let ready = ctx.agent_manager.tasks_ready();
+            Ok(serde_json::to_value(ready).unwrap())
+        }
+        "task.log_add" => {
+            #[derive(Deserialize)]
+            struct P { task_id: String, message: String, #[serde(default)] agent_id: Option<String> }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(p) => ctx.agent_manager.task_log_add(&p.task_id, p.agent_id.as_deref(), &p.message)
+                    .map(|_| serde_json::json!("ok")),
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+
+        // --- Orchestration Config ---
+        "orchestration.start" => {
+            #[derive(Deserialize)]
+            struct P {
+                #[serde(default)] leader_agent_id: Option<String>,
+                #[serde(default)] auto_dispatch: bool,
+            }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(p) => {
+                    let _ = ctx.agent_manager.set_config("enabled", "true");
+                    if p.auto_dispatch {
+                        let _ = ctx.agent_manager.set_config("auto_dispatch", "true");
+                    }
+                    if let Some(ref leader) = p.leader_agent_id {
+                        let _ = ctx.agent_manager.set_config("leader_id", leader);
+                    }
+                    Ok(serde_json::json!({
+                        "enabled": true,
+                        "auto_dispatch": p.auto_dispatch,
+                        "leader_id": p.leader_agent_id,
+                    }))
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "orchestration.stop" => {
+            let _ = ctx.agent_manager.set_config("enabled", "false");
+            let _ = ctx.agent_manager.set_config("auto_dispatch", "false");
+            Ok(serde_json::json!({"enabled": false}))
+        }
+        "orchestration.status" => {
+            let enabled = ctx.agent_manager.get_config("enabled").unwrap_or_else(|| "false".into());
+            let auto_dispatch = ctx.agent_manager.get_config("auto_dispatch").unwrap_or_else(|| "false".into());
+            let leader_id = ctx.agent_manager.get_config("leader_id");
+            let idle_count = ctx.agent_manager.agents_idle().len();
+            let ready_count = ctx.agent_manager.tasks_ready().len();
+            Ok(serde_json::json!({
+                "enabled": enabled == "true",
+                "auto_dispatch": auto_dispatch == "true",
+                "leader_id": leader_id,
+                "idle_agents": idle_count,
+                "ready_tasks": ready_count,
+            }))
+        }
+        "orchestration.goal" => {
+            #[derive(Deserialize)]
+            struct P { description: String }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(p) => {
+                    // Create a meta-task for the goal
+                    match ctx.agent_manager.task_create(crate::agent::TaskCreateParams {
+                        title: p.description.clone(),
+                        description: Some(format!("[GOAL] {}", p.description)),
+                        priority: Some(100),
+                        created_by: ctx.agent_manager.get_config("leader_id"),
+                        deps: None,
+                    }) {
+                        Ok(task) => {
+                            // If a leader is configured, send the goal as a message
+                            if let Some(leader_id) = ctx.agent_manager.get_config("leader_id") {
+                                let content = format!("[CMUX-GOAL] {}", p.description);
+                                let _ = ctx.agent_manager.message_send(crate::agent::MessageSendParams {
+                                    from_agent: None,
+                                    to_agent: leader_id,
+                                    content,
+                                });
+                            }
+                            Ok(serde_json::to_value(task).unwrap())
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+
         _ => Err(format!("unknown method: {}", req.method)),
     };
 

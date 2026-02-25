@@ -75,6 +75,17 @@ pub async fn serve(
         .route("/api/messages", post(messages_send_handler))
         .route("/api/messages/ack", post(messages_ack_handler))
         .route("/api/messages/{agent_id}", get(messages_list_handler))
+        // Orchestration endpoints
+        .route("/api/agents/idle", get(agents_idle_handler))
+        .route("/api/agents/{id}/activity", post(agents_activity_handler))
+        .route("/api/agents/{id}/heartbeat", post(agents_heartbeat_handler))
+        .route("/api/tasks/ready", get(tasks_ready_handler))
+        .route("/api/tasks/{id}/complete", post(tasks_complete_handler))
+        .route("/api/tasks/{id}/fail", post(tasks_fail_handler))
+        .route("/api/orchestration/start", post(orchestration_start_handler))
+        .route("/api/orchestration/stop", post(orchestration_stop_handler))
+        .route("/api/orchestration/status", get(orchestration_status_handler))
+        .route("/api/orchestration/goal", post(orchestration_goal_handler))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -472,6 +483,165 @@ async fn messages_ack_handler(
 ) -> impl IntoResponse {
     match state.agent_manager.message_ack(&req.message_ids) {
         Ok(n) => Json(serde_json::json!({"acknowledged": n})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+// --- Orchestration Handlers ---
+
+async fn agents_idle_handler(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+    let idle = state.agent_manager.agents_idle();
+    Json(serde_json::to_value(idle).unwrap())
+}
+
+#[derive(Deserialize)]
+struct ActivityRequest {
+    activity: String,
+    #[serde(default)]
+    task_id: Option<String>,
+}
+
+async fn agents_activity_handler(
+    State(state): State<Arc<HttpState>>,
+    Path(id): Path<String>,
+    Json(req): Json<ActivityRequest>,
+) -> impl IntoResponse {
+    let activity = crate::agent::AgentActivity::from_str(&req.activity);
+    match state.agent_manager.set_activity(&id, activity, req.task_id.as_deref()) {
+        Ok(_) => Json(serde_json::json!({"status": "ok"})).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+async fn agents_heartbeat_handler(
+    State(state): State<Arc<HttpState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.agent_manager.heartbeat(&id) {
+        Ok(_) => Json(serde_json::json!({"status": "ok"})).into_response(),
+        Err(e) => (StatusCode::NOT_FOUND, e).into_response(),
+    }
+}
+
+async fn tasks_ready_handler(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+    let ready = state.agent_manager.tasks_ready();
+    Json(serde_json::to_value(ready).unwrap())
+}
+
+#[derive(Deserialize)]
+struct TaskCompleteRequest {
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    result: Option<String>,
+}
+
+async fn tasks_complete_handler(
+    State(state): State<Arc<HttpState>>,
+    Path(id): Path<String>,
+    body: Option<Json<TaskCompleteRequest>>,
+) -> impl IntoResponse {
+    let (agent_id, result) = body.map(|b| (b.agent_id.clone(), b.result.clone())).unwrap_or_default();
+    match state.agent_manager.task_complete(&id, agent_id.as_deref(), result.as_deref()) {
+        Ok(task) => Json(serde_json::to_value(task).unwrap()).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct TaskFailRequest {
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+async fn tasks_fail_handler(
+    State(state): State<Arc<HttpState>>,
+    Path(id): Path<String>,
+    body: Option<Json<TaskFailRequest>>,
+) -> impl IntoResponse {
+    let (agent_id, error) = body.map(|b| (b.agent_id.clone(), b.error.clone())).unwrap_or_default();
+    match state.agent_manager.task_fail(&id, agent_id.as_deref(), error.as_deref()) {
+        Ok(task) => Json(serde_json::to_value(task).unwrap()).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct OrchStartRequest {
+    #[serde(default)]
+    leader_agent_id: Option<String>,
+    #[serde(default)]
+    auto_dispatch: bool,
+}
+
+async fn orchestration_start_handler(
+    State(state): State<Arc<HttpState>>,
+    Json(req): Json<OrchStartRequest>,
+) -> impl IntoResponse {
+    let _ = state.agent_manager.set_config("enabled", "true");
+    if req.auto_dispatch {
+        let _ = state.agent_manager.set_config("auto_dispatch", "true");
+    }
+    if let Some(ref leader) = req.leader_agent_id {
+        let _ = state.agent_manager.set_config("leader_id", leader);
+    }
+    Json(serde_json::json!({
+        "enabled": true,
+        "auto_dispatch": req.auto_dispatch,
+        "leader_id": req.leader_agent_id,
+    }))
+}
+
+async fn orchestration_stop_handler(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+    let _ = state.agent_manager.set_config("enabled", "false");
+    let _ = state.agent_manager.set_config("auto_dispatch", "false");
+    Json(serde_json::json!({"enabled": false}))
+}
+
+async fn orchestration_status_handler(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+    let enabled = state.agent_manager.get_config("enabled").unwrap_or_else(|| "false".into());
+    let auto_dispatch = state.agent_manager.get_config("auto_dispatch").unwrap_or_else(|| "false".into());
+    let leader_id = state.agent_manager.get_config("leader_id");
+    let idle_count = state.agent_manager.agents_idle().len();
+    let ready_count = state.agent_manager.tasks_ready().len();
+    Json(serde_json::json!({
+        "enabled": enabled == "true",
+        "auto_dispatch": auto_dispatch == "true",
+        "leader_id": leader_id,
+        "idle_agents": idle_count,
+        "ready_tasks": ready_count,
+    }))
+}
+
+#[derive(Deserialize)]
+struct GoalRequest {
+    description: String,
+}
+
+async fn orchestration_goal_handler(
+    State(state): State<Arc<HttpState>>,
+    Json(req): Json<GoalRequest>,
+) -> impl IntoResponse {
+    let task = state.agent_manager.task_create(crate::agent::TaskCreateParams {
+        title: req.description.clone(),
+        description: Some(format!("[GOAL] {}", req.description)),
+        priority: Some(100),
+        created_by: state.agent_manager.get_config("leader_id"),
+        deps: None,
+    });
+    match task {
+        Ok(t) => {
+            if let Some(leader_id) = state.agent_manager.get_config("leader_id") {
+                let _ = state.agent_manager.message_send(crate::agent::MessageSendParams {
+                    from_agent: None,
+                    to_agent: leader_id,
+                    content: format!("[CMUX-GOAL] {}", req.description),
+                });
+            }
+            (StatusCode::CREATED, Json(serde_json::to_value(t).unwrap())).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }

@@ -1,4 +1,5 @@
 mod agent;
+mod dispatch;
 mod http;
 mod monitor;
 mod socket;
@@ -66,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 5. Unix socket server
     let socket_path = socket::default_socket_path();
+    let dispatch_shutdown_rx = shutdown_rx.clone();
     let socket_task = tokio::spawn(socket::serve(
         socket_path.clone(),
         monitor_rx,
@@ -77,14 +79,20 @@ async fn main() -> anyhow::Result<()> {
         shutdown_rx,
     ));
 
-    // 6. Wait for shutdown signal (Ctrl-C or SIGTERM)
+    // 6. Auto-dispatch loop (orchestration)
+    let _dispatch_task = tokio::spawn(dispatch::run(
+        agent_manager.clone(),
+        dispatch_shutdown_rx,
+    ));
+
+    // 7. Wait for shutdown signal (Ctrl-C or SIGTERM)
     let shutdown_reason = tokio::select! {
         _ = tokio::signal::ctrl_c() => "SIGINT (Ctrl-C)",
         _ = sigterm() => "SIGTERM",
     };
     tracing::info!("received {shutdown_reason}, initiating graceful shutdown...");
 
-    // 7. Shutdown sequence
+    // 8. Shutdown sequence
     // a. Signal servers to stop
     let _ = shutdown_tx.send(true);
 

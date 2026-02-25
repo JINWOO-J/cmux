@@ -42,6 +42,30 @@ impl SessionStatus {
     }
 }
 
+/// Work state of an agent (orthogonal to SessionStatus lifecycle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentActivity {
+    Idle,
+    Busy,
+}
+
+impl AgentActivity {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Busy => "busy",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "busy" => Self::Busy,
+            _ => Self::Idle,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSession {
     pub id: String,
@@ -53,6 +77,10 @@ pub struct AgentSession {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     pub status: SessionStatus,
+    pub activity: AgentActivity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_task_id: Option<String>,
+    pub last_heartbeat_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     pub tracked_pids: Vec<u32>,
@@ -145,6 +173,8 @@ pub struct Task {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_by: Option<String>,
     pub deps: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
@@ -349,13 +379,48 @@ impl AgentSessionManager {
             );
         }
 
+        // Migration: add activity/current_task_id/last_heartbeat_ms columns to agent_sessions
+        let has_activity: bool = db
+            .prepare("SELECT COUNT(*) FROM pragma_table_info('agent_sessions') WHERE name='activity'")
+            .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
+            .map(|c| c > 0)
+            .unwrap_or(false);
+        if !has_activity {
+            let _ = db.execute_batch(
+                "ALTER TABLE agent_sessions ADD COLUMN activity TEXT NOT NULL DEFAULT 'idle';
+                 ALTER TABLE agent_sessions ADD COLUMN current_task_id TEXT;
+                 ALTER TABLE agent_sessions ADD COLUMN last_heartbeat_ms INTEGER NOT NULL DEFAULT 0;"
+            );
+        }
+
+        // Migration: add result column to tasks
+        let has_result: bool = db
+            .prepare("SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name='result'")
+            .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
+            .map(|c| c > 0)
+            .unwrap_or(false);
+        if !has_result {
+            let _ = db.execute_batch(
+                "ALTER TABLE tasks ADD COLUMN result TEXT"
+            );
+        }
+
+        // Migration: orchestration config table
+        let _ = db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS orchestration_config (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );"
+        );
+
         // Load non-terminated sessions into memory
         let mut sessions = HashMap::new();
         {
             let mut stmt = db.prepare(
                 "SELECT s.id, s.name, s.repo_path, s.worktree_name, s.worktree_path,
                         s.worktree_branch, s.command, s.status, s.pid, s.panel_id,
-                        s.created_at_ms, s.terminated_at_ms
+                        s.created_at_ms, s.terminated_at_ms,
+                        s.activity, s.current_task_id, s.last_heartbeat_ms
                  FROM agent_sessions s
                  WHERE s.status != 'terminated'"
             )?;
@@ -371,6 +436,9 @@ impl AgentSessionManager {
                     worktree_branch: row.get(5)?,
                     command: row.get(6)?,
                     status: SessionStatus::from_str(&row.get::<_, String>(7)?),
+                    activity: AgentActivity::from_str(&row.get::<_, String>(12).unwrap_or_else(|_| "idle".into())),
+                    current_task_id: row.get(13)?,
+                    last_heartbeat_ms: row.get::<_, u64>(14).unwrap_or(0),
                     pid: row.get::<_, Option<u32>>(8)?,
                     tracked_pids: Vec::new(), // loaded below
                     panel_id: row.get(9)?,
@@ -437,6 +505,7 @@ impl AgentSessionManager {
             // Watch the worktree directory
             watcher.watch_path(&wt_info.path);
 
+            let ts = now_ms();
             let session = AgentSession {
                 id: uuid::Uuid::new_v4().to_string(),
                 name,
@@ -446,12 +515,37 @@ impl AgentSessionManager {
                 worktree_branch: wt_info.branch.clone(),
                 command: params.command.clone(),
                 status: SessionStatus::Running,
+                activity: AgentActivity::Idle,
+                current_task_id: None,
+                last_heartbeat_ms: ts,
                 pid: None,
                 tracked_pids: Vec::new(),
                 panel_id: None,
-                created_at_ms: now_ms(),
+                created_at_ms: ts,
                 terminated_at_ms: None,
             };
+
+            // Write .cmux/agent.json for cmux-ctl auto-detection
+            let cmux_dir = PathBuf::from(&wt_info.path).join(".cmux");
+            if let Err(e) = std::fs::create_dir_all(&cmux_dir) {
+                tracing::warn!("failed to create .cmux dir: {e}");
+            } else {
+                let agent_json = serde_json::json!({
+                    "agent_id": session.id,
+                    "socket_path": crate::socket::default_socket_path().to_string_lossy(),
+                });
+                let agent_json_path = cmux_dir.join("agent.json");
+                if let Err(e) = std::fs::write(&agent_json_path, serde_json::to_string_pretty(&agent_json).unwrap_or_default()) {
+                    tracing::warn!("failed to write agent.json: {e}");
+                }
+                // Add .cmux/ to .git/info/exclude so it's not committed
+                let exclude_path = PathBuf::from(&wt_info.path).join(".git").join("info").join("exclude");
+                if let Ok(content) = std::fs::read_to_string(&exclude_path) {
+                    if !content.contains(".cmux/") {
+                        let _ = std::fs::write(&exclude_path, format!("{content}\n.cmux/\n"));
+                    }
+                }
+            }
 
             // Persist to DB + memory
             {
@@ -459,8 +553,9 @@ impl AgentSessionManager {
                 inner.db.execute(
                     "INSERT INTO agent_sessions
                         (id, name, repo_path, worktree_name, worktree_path, worktree_branch,
-                         command, status, pid, panel_id, created_at_ms, terminated_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                         command, status, pid, panel_id, created_at_ms, terminated_at_ms,
+                         activity, current_task_id, last_heartbeat_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                     params![
                         session.id,
                         session.name,
@@ -474,6 +569,9 @@ impl AgentSessionManager {
                         session.panel_id,
                         session.created_at_ms,
                         session.terminated_at_ms,
+                        session.activity.as_str(),
+                        session.current_task_id,
+                        session.last_heartbeat_ms,
                     ],
                 ).map_err(|e| format!("DB insert failed: {e}"))?;
             }
@@ -504,7 +602,8 @@ impl AgentSessionManager {
 
             if let Ok(mut stmt) = inner.db.prepare(
                 "SELECT id, name, repo_path, worktree_name, worktree_path, worktree_branch,
-                        command, status, pid, panel_id, created_at_ms, terminated_at_ms
+                        command, status, pid, panel_id, created_at_ms, terminated_at_ms,
+                        activity, current_task_id, last_heartbeat_ms
                  FROM agent_sessions WHERE status = 'terminated'"
             ) {
                 if let Ok(rows) = stmt.query_map([], |row| {
@@ -517,6 +616,9 @@ impl AgentSessionManager {
                         worktree_branch: row.get(5)?,
                         command: row.get(6)?,
                         status: SessionStatus::from_str(&row.get::<_, String>(7)?),
+                        activity: AgentActivity::from_str(&row.get::<_, String>(12).unwrap_or_else(|_| "idle".into())),
+                        current_task_id: row.get(13)?,
+                        last_heartbeat_ms: row.get::<_, u64>(14).unwrap_or(0),
                         pid: row.get::<_, Option<u32>>(8)?,
                         tracked_pids: Vec::new(),
                         panel_id: row.get(9)?,
@@ -549,7 +651,8 @@ impl AgentSessionManager {
         // Check DB for terminated sessions
         inner.db.query_row(
             "SELECT id, name, repo_path, worktree_name, worktree_path, worktree_branch,
-                    command, status, pid, panel_id, created_at_ms, terminated_at_ms
+                    command, status, pid, panel_id, created_at_ms, terminated_at_ms,
+                    activity, current_task_id, last_heartbeat_ms
              FROM agent_sessions WHERE id = ?1",
             params![id],
             |row| {
@@ -562,6 +665,9 @@ impl AgentSessionManager {
                     worktree_branch: row.get(5)?,
                     command: row.get(6)?,
                     status: SessionStatus::from_str(&row.get::<_, String>(7)?),
+                    activity: AgentActivity::from_str(&row.get::<_, String>(12).unwrap_or_else(|_| "idle".into())),
+                    current_task_id: row.get(13)?,
+                    last_heartbeat_ms: row.get::<_, u64>(14).unwrap_or(0),
                     pid: row.get::<_, Option<u32>>(8)?,
                     tracked_pids: Vec::new(),
                     panel_id: row.get(9)?,
@@ -739,6 +845,7 @@ impl AgentSessionManager {
             assignee: None,
             created_by: params.created_by,
             deps,
+            result: None,
             created_at_ms: ts,
             updated_at_ms: ts,
         })
@@ -748,7 +855,7 @@ impl AgentSessionManager {
     pub fn task_get(&self, id: &str) -> Result<Task, String> {
         let inner = self.inner.lock().unwrap();
         let task = inner.db.query_row(
-            "SELECT id, title, description, status, priority, assignee, created_by, created_at_ms, updated_at_ms
+            "SELECT id, title, description, status, priority, assignee, created_by, created_at_ms, updated_at_ms, result
              FROM tasks WHERE id = ?1",
             params![id],
             |row| {
@@ -761,6 +868,7 @@ impl AgentSessionManager {
                     assignee: row.get(5)?,
                     created_by: row.get(6)?,
                     deps: Vec::new(),
+                    result: row.get(9)?,
                     created_at_ms: row.get(7)?,
                     updated_at_ms: row.get(8)?,
                 })
@@ -775,7 +883,7 @@ impl AgentSessionManager {
     pub fn task_list(&self, params: TaskListParams) -> Vec<Task> {
         let inner = self.inner.lock().unwrap();
         let mut sql = String::from(
-            "SELECT id, title, description, status, priority, assignee, created_by, created_at_ms, updated_at_ms FROM tasks WHERE 1=1"
+            "SELECT id, title, description, status, priority, assignee, created_by, created_at_ms, updated_at_ms, result FROM tasks WHERE 1=1"
         );
         let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
@@ -805,6 +913,7 @@ impl AgentSessionManager {
                 assignee: row.get(5)?,
                 created_by: row.get(6)?,
                 deps: Vec::new(),
+                result: row.get(9)?,
                 created_at_ms: row.get(7)?,
                 updated_at_ms: row.get(8)?,
             })
@@ -956,6 +1065,17 @@ impl AgentSessionManager {
 
         drop(inner);
         self.task_get(&params.task_id)
+    }
+
+    /// Add a log entry to a task.
+    pub fn task_log_add(&self, task_id: &str, agent_id: Option<&str>, message: &str) -> Result<(), String> {
+        let inner = self.inner.lock().unwrap();
+        let ts = now_ms();
+        inner.db.execute(
+            "INSERT INTO task_log (task_id, agent_id, message, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
+            params![task_id, agent_id, message, ts],
+        ).map_err(|e| format!("log insert failed: {e}"))?;
+        Ok(())
     }
 
     /// Get task log entries.
@@ -1116,6 +1236,252 @@ impl AgentSessionManager {
     }
 
     // -----------------------------------------------------------------------
+    // Activity & Heartbeat (Orchestration)
+    // -----------------------------------------------------------------------
+
+    /// Set agent activity (idle/busy) and optionally bind a task.
+    pub fn set_activity(
+        &self,
+        session_id: &str,
+        activity: AgentActivity,
+        task_id: Option<&str>,
+    ) -> Result<(), String> {
+        let mut inner = self.inner.lock().unwrap();
+        let session = inner.sessions.get_mut(session_id)
+            .ok_or_else(|| format!("session not found: {session_id}"))?;
+        session.activity = activity;
+        session.current_task_id = task_id.map(|s| s.to_string());
+        let _ = inner.db.execute(
+            "UPDATE agent_sessions SET activity = ?1, current_task_id = ?2 WHERE id = ?3",
+            params![activity.as_str(), task_id, session_id],
+        );
+        Ok(())
+    }
+
+    /// Update heartbeat timestamp for an agent.
+    pub fn heartbeat(&self, session_id: &str) -> Result<(), String> {
+        let ts = now_ms();
+        let mut inner = self.inner.lock().unwrap();
+        let session = inner.sessions.get_mut(session_id)
+            .ok_or_else(|| format!("session not found: {session_id}"))?;
+        session.last_heartbeat_ms = ts;
+        let _ = inner.db.execute(
+            "UPDATE agent_sessions SET last_heartbeat_ms = ?1 WHERE id = ?2",
+            params![ts, session_id],
+        );
+        Ok(())
+    }
+
+    /// List agents that are active and idle.
+    pub fn agents_idle(&self) -> Vec<AgentSession> {
+        let inner = self.inner.lock().unwrap();
+        inner.sessions.values()
+            .filter(|s| s.status == SessionStatus::Running && s.activity == AgentActivity::Idle)
+            .cloned()
+            .collect()
+    }
+
+    /// List tasks that are pending and have all deps completed (ready to dispatch).
+    pub fn tasks_ready(&self) -> Vec<Task> {
+        let inner = self.inner.lock().unwrap();
+        // Get all pending tasks
+        let mut stmt = match inner.db.prepare(
+            "SELECT id, title, description, status, priority, assignee, created_by, created_at_ms, updated_at_ms, result
+             FROM tasks WHERE status = 'pending' ORDER BY priority DESC, created_at_ms ASC"
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+
+        let rows = match stmt.query_map([], |row| {
+            Ok(Task {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                description: row.get(2)?,
+                status: TaskStatus::Pending,
+                priority: row.get(4)?,
+                assignee: row.get(5)?,
+                created_by: row.get(6)?,
+                deps: Vec::new(),
+                result: row.get(9)?,
+                created_at_ms: row.get(7)?,
+                updated_at_ms: row.get(8)?,
+            })
+        }) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut ready = Vec::new();
+        for task in rows.flatten() {
+            let deps = Self::load_deps(&inner.db, &task.id);
+            if deps.is_empty() {
+                ready.push(Task { deps, ..task });
+                continue;
+            }
+            // Check all deps are completed
+            let placeholders: Vec<String> = deps.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+            let sql = format!(
+                "SELECT COUNT(*) FROM tasks WHERE id IN ({}) AND status != 'completed'",
+                placeholders.join(", ")
+            );
+            if let Ok(mut check) = inner.db.prepare(&sql) {
+                let dep_refs: Vec<&dyn rusqlite::types::ToSql> = deps.iter().map(|d| d as &dyn rusqlite::types::ToSql).collect();
+                if let Ok(incomplete) = check.query_row(dep_refs.as_slice(), |row| row.get::<_, i64>(0)) {
+                    if incomplete == 0 {
+                        ready.push(Task { deps, ..task });
+                    }
+                }
+            }
+        }
+        ready
+    }
+
+    /// Mark a task as completed: in_progress → completed, agent → idle.
+    pub fn task_complete(
+        &self,
+        task_id: &str,
+        agent_id: Option<&str>,
+        result: Option<&str>,
+    ) -> Result<Task, String> {
+        let inner = self.inner.lock().unwrap();
+
+        // Verify task is in_progress
+        let current_status_str: String = inner.db.query_row(
+            "SELECT status FROM tasks WHERE id = ?1",
+            params![task_id],
+            |row| row.get(0),
+        ).map_err(|_| format!("task not found: {task_id}"))?;
+
+        let current_status = TaskStatus::from_str(&current_status_str)
+            .ok_or_else(|| format!("invalid status: {current_status_str}"))?;
+
+        if !current_status.can_transition_to(TaskStatus::Completed) {
+            return Err(format!(
+                "cannot complete task in status: {}",
+                current_status.as_str()
+            ));
+        }
+
+        let ts = now_ms();
+        inner.db.execute(
+            "UPDATE tasks SET status = 'completed', result = ?1, updated_at_ms = ?2 WHERE id = ?3",
+            params![result, ts, task_id],
+        ).map_err(|e| format!("update failed: {e}"))?;
+
+        // Log
+        let log_msg = match result {
+            Some(r) => format!("completed: {r}"),
+            None => "completed".into(),
+        };
+        let _ = inner.db.execute(
+            "INSERT INTO task_log (task_id, agent_id, message, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
+            params![task_id, agent_id, log_msg, ts],
+        );
+
+        // Set agent to idle
+        if let Some(aid) = agent_id {
+            if let Some(session) = inner.sessions.get(aid).cloned() {
+                drop(inner);
+                let _ = self.set_activity(aid, AgentActivity::Idle, None);
+                let _ = session; // suppress unused warning
+                return self.task_get(task_id);
+            }
+        }
+
+        drop(inner);
+        self.task_get(task_id)
+    }
+
+    /// Mark a task as failed: in_progress → failed, agent → idle.
+    pub fn task_fail(
+        &self,
+        task_id: &str,
+        agent_id: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<Task, String> {
+        let inner = self.inner.lock().unwrap();
+
+        let current_status_str: String = inner.db.query_row(
+            "SELECT status FROM tasks WHERE id = ?1",
+            params![task_id],
+            |row| row.get(0),
+        ).map_err(|_| format!("task not found: {task_id}"))?;
+
+        let current_status = TaskStatus::from_str(&current_status_str)
+            .ok_or_else(|| format!("invalid status: {current_status_str}"))?;
+
+        if !current_status.can_transition_to(TaskStatus::Failed) {
+            return Err(format!(
+                "cannot fail task in status: {}",
+                current_status.as_str()
+            ));
+        }
+
+        let ts = now_ms();
+        let result_text = error.map(|e| format!("FAILED: {e}"));
+        inner.db.execute(
+            "UPDATE tasks SET status = 'failed', result = ?1, updated_at_ms = ?2 WHERE id = ?3",
+            params![result_text, ts, task_id],
+        ).map_err(|e| format!("update failed: {e}"))?;
+
+        let log_msg = match error {
+            Some(e) => format!("failed: {e}"),
+            None => "failed".into(),
+        };
+        let _ = inner.db.execute(
+            "INSERT INTO task_log (task_id, agent_id, message, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
+            params![task_id, agent_id, log_msg, ts],
+        );
+
+        // Set agent to idle
+        if let Some(aid) = agent_id {
+            if inner.sessions.contains_key(aid) {
+                drop(inner);
+                let _ = self.set_activity(aid, AgentActivity::Idle, None);
+                return self.task_get(task_id);
+            }
+        }
+
+        drop(inner);
+        self.task_get(task_id)
+    }
+
+    // -----------------------------------------------------------------------
+    // Orchestration Config
+    // -----------------------------------------------------------------------
+
+    /// Get an orchestration config value.
+    pub fn get_config(&self, key: &str) -> Option<String> {
+        let inner = self.inner.lock().unwrap();
+        inner.db.query_row(
+            "SELECT value FROM orchestration_config WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        ).ok()
+    }
+
+    /// Set an orchestration config value.
+    pub fn set_config(&self, key: &str, value: &str) -> Result<(), String> {
+        let inner = self.inner.lock().unwrap();
+        inner.db.execute(
+            "INSERT OR REPLACE INTO orchestration_config (key, value) VALUES (?1, ?2)",
+            params![key, value],
+        ).map_err(|e| format!("set_config failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Delete an orchestration config value.
+    pub fn delete_config(&self, key: &str) -> Result<(), String> {
+        let inner = self.inner.lock().unwrap();
+        inner.db.execute(
+            "DELETE FROM orchestration_config WHERE key = ?1",
+            params![key],
+        ).map_err(|e| format!("delete_config failed: {e}"))?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
 
@@ -1226,6 +1592,9 @@ mod tests {
                 worktree_branch: "branch".into(),
                 command: None,
                 status: SessionStatus::Running,
+                activity: AgentActivity::Idle,
+                current_task_id: None,
+                last_heartbeat_ms: 0,
                 pid: None,
                 tracked_pids: vec![],
                 panel_id: None,
@@ -1264,6 +1633,9 @@ mod tests {
                 worktree_branch: "b2".into(),
                 command: None,
                 status: SessionStatus::Spawning,
+                activity: AgentActivity::Idle,
+                current_task_id: None,
+                last_heartbeat_ms: 0,
                 pid: None,
                 tracked_pids: vec![],
                 panel_id: None,
@@ -1299,6 +1671,9 @@ mod tests {
             worktree_branch: "b".into(),
             command: None,
             status: SessionStatus::Running,
+            activity: AgentActivity::Idle,
+            current_task_id: None,
+            last_heartbeat_ms: 0,
             pid: None,
             tracked_pids: vec![],
             panel_id: None,
