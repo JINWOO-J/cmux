@@ -2740,6 +2740,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             return true
         }
 
+        // Clipboard History
+        if matchShortcut(event: event, shortcut: KeyboardShortcutSettings.shortcut(for: .clipboardHistory)) {
+            NotificationCenter.default.post(name: .clipboardHistoryToggleRequested, object: NSApp.keyWindow)
+            return true
+        }
+
         // Flash the currently focused panel so the user can visually confirm focus.
         if matchShortcut(event: event, shortcut: KeyboardShortcutSettings.shortcut(for: .triggerFlash)) {
             tabManager?.triggerFocusFlash()

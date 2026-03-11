@@ -725,6 +725,7 @@ final class FileDropOverlayView: NSView {
 
 var fileDropOverlayKey: UInt8 = 0
 private var commandPaletteWindowOverlayKey: UInt8 = 0
+private var clipboardHistoryWindowOverlayKey: UInt8 = 0
 let commandPaletteOverlayContainerIdentifier = NSUserInterfaceItemIdentifier("term-mesh.commandPalette.overlay.container")
 
 @MainActor
@@ -983,6 +984,16 @@ private func commandPaletteWindowOverlayController(for window: NSWindow) -> Wind
     return controller
 }
 
+@MainActor
+private func clipboardHistoryWindowOverlayController(for window: NSWindow) -> WindowCommandPaletteOverlayController {
+    if let existing = objc_getAssociatedObject(window, &clipboardHistoryWindowOverlayKey) as? WindowCommandPaletteOverlayController {
+        return existing
+    }
+    let controller = WindowCommandPaletteOverlayController(window: window)
+    objc_setAssociatedObject(window, &clipboardHistoryWindowOverlayKey, controller, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+    return controller
+}
+
 enum WorkspaceMountPolicy {
     // Keep only the selected workspace mounted to minimize layer-tree traversal.
     static let maxMountedWorkspaces = 1
@@ -1121,6 +1132,8 @@ struct ContentView: View {
     @State private var isResizerBandActive = false
     @State private var isSidebarResizerCursorActive = false
     @State private var sidebarResizerCursorStabilizer: DispatchSourceTimer?
+    @State private var isClipboardHistoryPresented = false
+    @ObservedObject private var clipboardHistoryStore = ClipboardHistoryStore.shared
     @State private var isCommandPalettePresented = false
     @State private var commandPaletteQuery: String = ""
     @State private var commandPaletteMode: CommandPaletteMode = .commands
@@ -2539,10 +2552,32 @@ struct ContentView: View {
             _ = handleCommandPaletteRenameDeleteBackward(modifiers: [])
         })
 
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .clipboardHistoryToggleRequested)) { notification in
+            let requestedWindow = notification.object as? NSWindow
+            guard Self.shouldHandleCommandPaletteRequest(
+                observedWindow: observedWindow,
+                requestedWindow: requestedWindow,
+                keyWindow: NSApp.keyWindow,
+                mainWindow: NSApp.mainWindow
+            ) else { return }
+            isClipboardHistoryPresented.toggle()
+        })
+
         view = AnyView(view.background(WindowAccessor(dedupeByWindow: false) { window in
             MainActor.assumeIsolated {
                 let overlayController = commandPaletteWindowOverlayController(for: window)
                 overlayController.update(rootView: AnyView(commandPaletteOverlay), isVisible: isCommandPalettePresented)
+
+                let clipboardOverlay = clipboardHistoryWindowOverlayController(for: window)
+                clipboardOverlay.update(
+                    rootView: AnyView(
+                        ClipboardHistoryOverlay(
+                            store: clipboardHistoryStore,
+                            isPresented: $isClipboardHistoryPresented
+                        )
+                    ),
+                    isVisible: isClipboardHistoryPresented
+                )
             }
         }))
 

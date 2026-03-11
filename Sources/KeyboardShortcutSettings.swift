@@ -38,6 +38,9 @@ enum KeyboardShortcutSettings {
         // Zoom
         case zoomPane
 
+        // Clipboard
+        case clipboardHistory
+
         // Panels
         case openBrowser
         case toggleBrowserDeveloperTools
@@ -73,6 +76,7 @@ enum KeyboardShortcutSettings {
             case .splitBrowserRight: return "Split Browser Right"
             case .splitBrowserDown: return "Split Browser Down"
             case .zoomPane: return "Zoom Pane"
+            case .clipboardHistory: return "Clipboard History"
             case .openBrowser: return "Open Browser"
             case .toggleBrowserDeveloperTools: return "Toggle Browser Developer Tools"
             case .showBrowserJavaScriptConsole: return "Show Browser JavaScript Console"
@@ -107,6 +111,7 @@ enum KeyboardShortcutSettings {
             case .prevSurface: return "shortcut.prevSurface"
             case .newSurface: return "shortcut.newSurface"
             case .zoomPane: return "shortcut.zoomPane"
+            case .clipboardHistory: return "shortcut.clipboardHistory"
             case .openBrowser: return "shortcut.openBrowser"
             case .toggleBrowserDeveloperTools: return "shortcut.toggleBrowserDeveloperTools"
             case .showBrowserJavaScriptConsole: return "shortcut.showBrowserJavaScriptConsole"
@@ -167,6 +172,8 @@ enum KeyboardShortcutSettings {
                 return StoredShortcut(key: "t", command: true, shift: false, option: false, control: false)
             case .zoomPane:
                 return StoredShortcut(key: "↩", command: true, shift: true, option: false, control: false)
+            case .clipboardHistory:
+                return StoredShortcut(key: "v", command: true, shift: true, option: false, control: false)
             case .openBrowser:
                 return StoredShortcut(key: "l", command: true, shift: true, option: false, control: false)
             case .toggleBrowserDeveloperTools:

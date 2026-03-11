@@ -3803,6 +3803,7 @@ enum ResizeDirection {
 }
 
 extension Notification.Name {
+    static let clipboardHistoryToggleRequested = Notification.Name("term-mesh.clipboardHistoryToggleRequested")
     static let commandPaletteToggleRequested = Notification.Name("term-mesh.commandPaletteToggleRequested")
     static let commandPaletteRequested = Notification.Name("term-mesh.commandPaletteRequested")
     static let commandPaletteSwitcherRequested = Notification.Name("term-mesh.commandPaletteSwitcherRequested")
